@@ -10,6 +10,18 @@ jobs:
       - uses: subosito/flutter-action@v2
         with: { channel: stable }
       - run: flutter create . --platforms=android
+      - name: Android SDK 36 ayarı
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/sdk.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.hasProperty('android')) {
+                p.android.compileSdkVersion 36
+              }
+            }
+          }
+          EOF
       - run: flutter pub get
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
