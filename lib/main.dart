@@ -1,25 +1,137 @@
-import 'package:epubx/epubx.dart' as epubx;
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:archive/archive.dart' show ZipDecoder;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
-/// Katalog kaydı. Okuma ilerlemesi burada değil, SharedPreferences'ta tutulur.
+// ======================= MODEL =======================
+
+const List<IconData> bookIcons = [
+  Icons.menu_book,
+  Icons.auto_stories,
+  Icons.book,
+  Icons.import_contacts,
+  Icons.library_books,
+  Icons.description,
+];
+
 class Book {
-  final String title;
-  final String author;
-  final IconData icon;
-  const Book(this.title, this.author, this.icon);
+  final String id;
+  String title;
+  String author;
+  int iconIndex;
+  bool sample;
+  int position; // son okunan kelimenin sırası
+  int percent;
+  int lastRead; // son okuma zamanı (ms)
+
+  Book({
+    required this.id,
+    required this.title,
+    required this.author,
+    this.iconIndex = 5,
+    this.sample = false,
+    this.position = 0,
+    this.percent = 0,
+    this.lastRead = 0,
+  });
+
+  IconData get icon => bookIcons[iconIndex < 0 || iconIndex >= bookIcons.length ? 5 : iconIndex];
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'author': author,
+        'icon': iconIndex,
+        'sample': sample,
+        'position': position,
+        'percent': percent,
+        'lastRead': lastRead,
+      };
+
+  factory Book.fromJson(Map<String, dynamic> j) => Book(
+        id: j['id'] as String,
+        title: j['title'] as String,
+        author: (j['author'] as String?) ?? '',
+        iconIndex: (j['icon'] as int?) ?? 5,
+        sample: (j['sample'] as bool?) ?? false,
+        position: (j['position'] as int?) ?? 0,
+        percent: (j['percent'] as int?) ?? 0,
+        lastRead: (j['lastRead'] as int?) ?? 0,
+      );
 }
 
-/// SharedPreferences sarmalayıcı: WPM ve okuma ilerlemesi kalıcıdır.
-class StorageService {
+// ======================= DEPOLAMA =======================
+
+/// Kitap listesi SharedPreferences'ta, kitap metinleri ise uygulamanın
+/// belge klasöründeki dosyalarda saklanır (büyük kitaplar için güvenli).
+class LibraryStore {
+  static const _key = 'library_v1';
   static const _wpmKey = 'default_wpm';
-  static const _progressPrefix = 'progress_';
+
+  static List<Book> seedBooks() => [
+        Book(id: 'sample_1', title: 'Suç ve Ceza', author: 'Fyodor Dostoyevski', iconIndex: 0, sample: true),
+        Book(id: 'sample_2', title: 'Sapiens', author: 'Yuval Noah Harari', iconIndex: 1, sample: true),
+        Book(id: 'sample_3', title: 'Düşün ve Zengin Ol', author: 'Napoleon Hill', iconIndex: 2, sample: true),
+        Book(id: 'sample_4', title: 'İnsan Ne ile Yaşar', author: 'Lev Tolstoy', iconIndex: 3, sample: true),
+        Book(id: 'sample_5', title: '1984', author: 'George Orwell', iconIndex: 4, sample: true),
+      ];
+
+  /// İlk açılışta örnek kitaplar eklenir. Hepsi silinirse liste boş kalır
+  /// (anahtar mevcut olduğu için örnekler geri gelmez).
+  static Future<List<Book>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_key);
+    if (raw == null) {
+      final seed = seedBooks();
+      await save(seed);
+      return seed;
+    }
+    try {
+      final list = jsonDecode(raw) as List;
+      return list.map((e) => Book.fromJson(e as Map<String, dynamic>)).toList();
+    } catch (_) {
+      return <Book>[];
+    }
+  }
+
+  static Future<void> save(List<Book> books) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key, jsonEncode(books.map((b) => b.toJson()).toList()));
+  }
+
+  static Future<Directory> _dir() async {
+    final base = await getApplicationDocumentsDirectory();
+    final dir = Directory('${base.path}/books');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
+
+  static Future<void> writeText(String id, String text) async {
+    final dir = await _dir();
+    await File('${dir.path}/$id.txt').writeAsString(text);
+  }
+
+  static Future<String?> readText(String id) async {
+    final dir = await _dir();
+    final f = File('${dir.path}/$id.txt');
+    if (await f.exists()) return f.readAsString();
+    return null;
+  }
+
+  static Future<void> deleteText(String id) async {
+    final dir = await _dir();
+    final f = File('${dir.path}/$id.txt');
+    if (await f.exists()) await f.delete();
+  }
 
   static Future<int> loadWpm({int fallback = 250}) async {
     final prefs = await SharedPreferences.getInstance();
@@ -30,22 +142,10 @@ class StorageService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_wpmKey, wpm);
   }
-
-  static Future<void> saveProgress(String bookTitle, int percent) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('$_progressPrefix$bookTitle', percent);
-  }
-
-  static Future<Map<String, int>> loadAllProgress(List<String> titles) async {
-    final prefs = await SharedPreferences.getInstance();
-    return {
-      for (final t in titles) t: prefs.getInt('$_progressPrefix$t') ?? 0,
-    };
-  }
 }
 
+// ======================= DOSYA İÇE AKTARMA =======================
 
-/// Kullanıcıya gösterilecek Türkçe hata mesajı taşır.
 class ImportException implements Exception {
   final String message;
   ImportException(this.message);
@@ -56,7 +156,8 @@ class ImportException implements Exception {
 class ImportResult {
   final String title;
   final String text;
-  ImportResult(this.title, this.text);
+  final String ext;
+  ImportResult(this.title, this.text, this.ext);
 }
 
 class ImportService {
@@ -87,9 +188,10 @@ class ImportService {
           throw ImportException('Desteklenmeyen dosya türü: .$extension');
       }
       if (text.trim().isEmpty) {
-        text = 'Dosyada metin bulunamadı.';
+        throw ImportException('Dosyada okunabilir metin bulunamadı.');
       }
-      return ImportResult(picked.name, text);
+      final title = picked.name.replaceFirst(RegExp(r'\.[^.]+$'), '');
+      return ImportResult(title, text, extension);
     } on ImportException {
       rethrow;
     } catch (e) {
@@ -115,27 +217,81 @@ class ImportService {
 
   static Future<String> _extractEpub(PlatformFile file) async {
     final bytes = await _bytesOf(file);
-    final book = await epubx.EpubReader.readBook(bytes);
+    final archive = ZipDecoder().decodeBytes(bytes);
+
+    String? readText(String path) {
+      final decoded = Uri.decodeFull(path);
+      for (final f in archive) {
+        if (f.isFile && (f.name == path || f.name == decoded)) {
+          return utf8.decode(f.content as List<int>, allowMalformed: true);
+        }
+      }
+      return null;
+    }
+
+    final container = readText('META-INF/container.xml');
+    final opfPath = container == null
+        ? null
+        : RegExp(r'full-path="([^"]+)"').firstMatch(container)?.group(1);
+
+    final names = <String>[];
+    if (opfPath != null) {
+      final opf = readText(opfPath);
+      if (opf != null) {
+        final baseDir = opfPath.contains('/')
+            ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1)
+            : '';
+        final manifest = <String, String>{};
+        for (final m in RegExp(r'<item\b[^>]*>').allMatches(opf)) {
+          final tag = m.group(0)!;
+          final id = RegExp(r'\bid="([^"]+)"').firstMatch(tag)?.group(1);
+          final href = RegExp(r'\bhref="([^"]+)"').firstMatch(tag)?.group(1);
+          if (id != null && href != null) manifest[id] = href;
+        }
+        for (final m in RegExp(r'<itemref\b[^>]*>').allMatches(opf)) {
+          final idref = RegExp(r'\bidref="([^"]+)"').firstMatch(m.group(0)!)?.group(1);
+          final href = idref == null ? null : manifest[idref];
+          if (href != null) names.add(baseDir + href);
+        }
+      }
+    }
+
+    if (names.isEmpty) {
+      names.addAll(archive
+          .where((f) => f.isFile && RegExp(r'\.(x?html?)$', caseSensitive: false).hasMatch(f.name))
+          .map((f) => f.name));
+      names.sort();
+    }
+
     final buffer = StringBuffer();
-    final chapters = book.Chapters ?? const [];
-    for (final chapter in chapters) {
-      buffer.writeln(_stripHtml(chapter.HtmlContent ?? ''));
+    for (final n in names) {
+      final html = readText(n);
+      if (html != null) buffer.writeln(_stripHtml(html));
     }
     return buffer.toString();
   }
 
   static Future<String> _extractTxt(PlatformFile file) async {
     final bytes = await _bytesOf(file);
-    return String.fromCharCodes(bytes);
+    return utf8.decode(bytes, allowMalformed: true);
   }
 
   static String _stripHtml(String html) {
     return html
+        .replaceAll(RegExp(r'<(script|style)[^>]*>.*?</\1>', dotAll: true, caseSensitive: false), ' ')
         .replaceAll(RegExp(r'<[^>]*>'), ' ')
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
   }
 }
+
+// ======================= ORTAK WIDGET'LAR =======================
 
 class PageFrame extends StatelessWidget {
   final Widget child;
@@ -165,9 +321,9 @@ class PageFrame extends StatelessWidget {
 
 class BookTile extends StatelessWidget {
   final Book book;
-  final int progress;
   final VoidCallback? onTap;
-  const BookTile({super.key, required this.book, required this.progress, this.onTap});
+  final VoidCallback? onDelete;
+  const BookTile({super.key, required this.book, this.onTap, this.onDelete});
 
   @override
   Widget build(BuildContext context) {
@@ -184,17 +340,23 @@ class BookTile extends StatelessWidget {
           ),
           child: Icon(book.icon),
         ),
-        title: Text(book.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+        title: Text(book.title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(book.author),
+            Text(book.author, maxLines: 1, overflow: TextOverflow.ellipsis),
             const SizedBox(height: 6),
-            LinearProgressIndicator(value: progress / 100),
-            Text('%$progress'),
+            LinearProgressIndicator(value: book.percent / 100),
+            Text('%${book.percent}'),
           ],
         ),
-        trailing: const Icon(Icons.chevron_right),
+        trailing: onDelete != null
+            ? IconButton(
+                tooltip: 'Sil',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: onDelete,
+              )
+            : const Icon(Icons.chevron_right),
       ),
     );
   }
@@ -202,32 +364,37 @@ class BookTile extends StatelessWidget {
 
 class MiniBook extends StatelessWidget {
   final Book book;
-  const MiniBook({super.key, required this.book});
+  final VoidCallback? onTap;
+  const MiniBook({super.key, required this.book, this.onTap});
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 92,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(9),
-                gradient: const LinearGradient(colors: [Color(0xFF765548), Color(0xFF18212B)]),
+    return GestureDetector(
+      onTap: onTap,
+      child: SizedBox(
+        width: 92,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(9),
+                  gradient: const LinearGradient(colors: [Color(0xFF765548), Color(0xFF18212B)]),
+                ),
+                child: Icon(book.icon, size: 36),
               ),
-              child: Icon(book.icon, size: 36),
             ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            book.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-          ),
-        ],
+            const SizedBox(height: 6),
+            Text(
+              book.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -267,15 +434,15 @@ class ChartPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
-/// Tüm hız seçenekleri (100-1000 WPM) herkese açıktır.
-class ReaderPage extends StatefulWidget {
-  final String? text;
-  final String? title;
+// ======================= OKUMA SAYFASI =======================
 
-  /// İlerlemeyi kaydetmek için benzersiz anahtar (kitap adı).
-  /// Alt menüdeki genel okuyucuda null'dır.
-  final String? bookKey;
-  const ReaderPage({super.key, this.text, this.title, this.bookKey});
+class ReaderPage extends StatefulWidget {
+  final Book? book;
+  final String? text;
+
+  /// (kelime sırası, yüzde) — okuma sırasında ve çıkışta çağrılır.
+  final void Function(int position, int percent)? onProgress;
+  const ReaderPage({super.key, this.book, this.text, this.onProgress});
 
   @override
   State<ReaderPage> createState() => _ReaderPageState();
@@ -302,24 +469,26 @@ class _ReaderPageState extends State<ReaderPage> {
     if (words.isEmpty) {
       words = _fallbackText.split(RegExp(r'\s+'));
     }
+    // Kaldığın yerden devam et (kitap bittiyse başa dön).
+    final saved = widget.book?.position ?? 0;
+    index = (saved >= words.length - 1 || saved < 0) ? 0 : saved;
     _loadWpm();
   }
 
   Future<void> _loadWpm() async {
-    final saved = await StorageService.loadWpm();
+    final saved = await LibraryStore.loadWpm();
     if (!mounted) return;
     setState(() {
-      wpm = saved.clamp(100, 1000);
+      wpm = saved.clamp(100, 1000).toInt();
       ready = true;
     });
   }
 
   int get _percent => (((index + 1) / words.length) * 100).round();
 
-  void _persistProgress() {
-    final key = widget.bookKey;
-    if (key == null) return;
-    StorageService.saveProgress(key, _percent);
+  void _saveProgress() {
+    if (widget.book == null) return;
+    widget.onProgress?.call(index, _percent);
   }
 
   void _startTimer() {
@@ -328,10 +497,11 @@ class _ReaderPageState extends State<ReaderPage> {
       if (index >= words.length - 1) {
         timer?.cancel();
         setState(() => playing = false);
+        _saveProgress();
         return;
       }
       setState(() => index++);
-      _persistProgress();
+      if (index % 25 == 0) _saveProgress();
     });
   }
 
@@ -339,6 +509,7 @@ class _ReaderPageState extends State<ReaderPage> {
     if (playing) {
       timer?.cancel();
       setState(() => playing = false);
+      _saveProgress();
       return;
     }
     setState(() => playing = true);
@@ -347,19 +518,19 @@ class _ReaderPageState extends State<ReaderPage> {
 
   void _setWpm(int value) {
     setState(() => wpm = value);
-    StorageService.saveWpm(value);
-    if (playing) _startTimer(); // hız değişince oynatma anında yeni hıza geçer
+    LibraryStore.saveWpm(value);
+    if (playing) _startTimer();
   }
 
   void _close() {
-    _persistProgress();
-    Navigator.pop(context, widget.bookKey != null ? _percent : null);
+    _saveProgress();
+    Navigator.pop(context);
   }
 
   @override
   void dispose() {
     timer?.cancel();
-    _persistProgress();
+    _saveProgress();
     super.dispose();
   }
 
@@ -388,7 +559,12 @@ class _ReaderPageState extends State<ReaderPage> {
                   children: [
                     IconButton(onPressed: _close, icon: const Icon(Icons.arrow_back)),
                     Expanded(
-                      child: Text(widget.title ?? 'FocusRead', style: const TextStyle(fontWeight: FontWeight.bold)),
+                      child: Text(
+                        widget.book?.title ?? 'FocusRead',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
                     ),
                     Text('$_percent%'),
                   ],
@@ -402,6 +578,7 @@ class _ReaderPageState extends State<ReaderPage> {
                     child: Text(
                       words[index],
                       key: ValueKey(index),
+                      textAlign: TextAlign.center,
                       style: const TextStyle(fontSize: 42, fontWeight: FontWeight.w700),
                     ),
                   ),
@@ -447,15 +624,24 @@ class _ReaderPageState extends State<ReaderPage> {
   }
 }
 
+// ======================= ANA SAYFA =======================
+
 class HomePage extends StatelessWidget {
   final List<Book> books;
-  final Map<String, int> progress;
-  final VoidCallback onContinue;
-  const HomePage({super.key, required this.books, required this.progress, required this.onContinue});
+  final Book? continuing;
+  final void Function(Book book) onOpen;
+  final VoidCallback onStart;
+  const HomePage({
+    super.key,
+    required this.books,
+    required this.continuing,
+    required this.onOpen,
+    required this.onStart,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final continuing = books.first;
+    final cont = continuing;
     return PageFrame(
       child: ListView(
         children: [
@@ -472,8 +658,6 @@ class HomePage extends StatelessWidget {
               ),
               const SizedBox(width: 10),
               const Text('FocusRead', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-              const Spacer(),
-              IconButton(onPressed: () {}, icon: const Icon(Icons.notifications_none)),
             ],
           ),
           const SizedBox(height: 30),
@@ -488,46 +672,64 @@ class HomePage extends StatelessWidget {
           ),
           const SizedBox(height: 22),
           FilledButton(
-            onPressed: onContinue,
+            onPressed: onStart,
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.all(17),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
             ),
-            child: const Text('Hemen Başla →', style: TextStyle(fontWeight: FontWeight.bold)),
-          ),
-          const SizedBox(height: 28),
-          const Text('Devam Edilen Kitap', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 10),
-          BookTile(book: continuing, progress: progress[continuing.title] ?? 0),
-          const SizedBox(height: 26),
-          const Text('Popüler Kitaplar', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          SizedBox(
-            height: 145,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: books.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 12),
-              itemBuilder: (_, i) => MiniBook(book: books[i]),
+            child: Text(
+              cont != null ? 'Kaldığın Yerden Devam Et →' : 'Hemen Başla →',
+              style: const TextStyle(fontWeight: FontWeight.bold),
             ),
           ),
+          const SizedBox(height: 28),
+          if (cont != null) ...[
+            const Text('Devam Edilen Kitap', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            BookTile(book: cont, onTap: () => onOpen(cont)),
+            const SizedBox(height: 26),
+          ],
+          if (books.isNotEmpty) ...[
+            const Text('Kitaplarım', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 145,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: books.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 12),
+                itemBuilder: (_, i) => MiniBook(book: books[i], onTap: () => onOpen(books[i])),
+              ),
+            ),
+          ] else
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text(
+                'Kitaplığın boş. Kitaplık sekmesinden PDF, EPUB veya TXT dosyası yükleyebilirsin.',
+                style: TextStyle(color: Colors.white70),
+              ),
+            ),
         ],
       ),
     );
   }
 }
 
+// ======================= KİTAPLIK =======================
+
 class LibraryPage extends StatefulWidget {
   final List<Book> books;
-  final Map<String, int> progress;
   final void Function(Book book) onOpenBook;
-  final void Function(String title, String text) onImported;
+  final Future<void> Function(ImportResult result) onImported;
+  final Future<void> Function(Book book) onDelete;
+  final Future<void> Function() onDeleteAll;
   const LibraryPage({
     super.key,
     required this.books,
-    required this.progress,
     required this.onOpenBook,
     required this.onImported,
+    required this.onDelete,
+    required this.onDeleteAll,
   });
 
   @override
@@ -540,20 +742,51 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _import() async {
     setState(() => importing = true);
+    ImportResult? result;
     try {
-      final result = await ImportService.pickAndImport();
-      if (result != null) {
-        widget.onImported(result.title, result.text);
-      }
+      result = await ImportService.pickAndImport();
     } on ImportException catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      _snack(e.message);
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Beklenmeyen bir hata oluştu: $e')));
-    } finally {
-      if (mounted) setState(() => importing = false);
+      _snack('Beklenmeyen bir hata oluştu: $e');
     }
+    if (mounted) setState(() => importing = false);
+    if (result != null && mounted) {
+      await widget.onImported(result);
+    }
+  }
+
+  void _snack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<bool> _confirm(String title, String message) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Sil')),
+        ],
+      ),
+    );
+    return ok ?? false;
+  }
+
+  Future<void> _deleteOne(Book book) async {
+    final ok = await _confirm('Kitabı sil', '"${book.title}" kitaplıktan silinsin mi?');
+    if (ok) await widget.onDelete(book);
+  }
+
+  Future<void> _deleteAll() async {
+    final ok = await _confirm(
+      'Tüm kitapları sil',
+      'Örnek kitaplar dahil kitaplıktaki ${widget.books.length} kitabın hepsi ve okuma ilerlemeleri silinecek. Bu işlem geri alınamaz.',
+    );
+    if (ok) await widget.onDeleteAll();
   }
 
   @override
@@ -573,36 +806,57 @@ class _LibraryPageState extends State<LibraryPage> {
               border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
             ),
           ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              const Chip(label: Text('Tümü')),
-              const SizedBox(width: 8),
-              TextButton(
-                onPressed: importing ? null : _import,
-                child: importing
-                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Text('+ Dosya Yükle (PDF/EPUB/TXT)'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 5),
-          Expanded(
-            child: ListView.separated(
-              itemCount: filtered.length,
-              separatorBuilder: (_, __) => const Divider(color: Colors.white10),
-              itemBuilder: (_, i) => BookTile(
-                book: filtered[i],
-                progress: widget.progress[filtered[i].title] ?? 0,
-                onTap: () => widget.onOpenBook(filtered[i]),
-              ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Wrap(
+              spacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                TextButton(
+                  onPressed: importing ? null : _import,
+                  child: importing
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('+ Dosya Yükle (PDF/EPUB/TXT)'),
+                ),
+                if (widget.books.isNotEmpty)
+                  TextButton(
+                    onPressed: _deleteAll,
+                    style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+                    child: const Text('Tümünü Sil'),
+                  ),
+              ],
             ),
+          ),
+          Expanded(
+            child: filtered.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        'Kitaplık boş.\n"+ Dosya Yükle" ile kitap ekleyebilirsin.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: filtered.length,
+                    separatorBuilder: (_, __) => const Divider(color: Colors.white10),
+                    itemBuilder: (_, i) => BookTile(
+                      book: filtered[i],
+                      onTap: () => widget.onOpenBook(filtered[i]),
+                      onDelete: () => _deleteOne(filtered[i]),
+                    ),
+                  ),
           ),
         ],
       ),
     );
   }
 }
+
+// ======================= İSTATİSTİK / AYARLAR / PROFİL =======================
 
 class StatsPage extends StatelessWidget {
   const StatsPage({super.key});
@@ -672,7 +926,8 @@ class SettingsPage extends StatelessWidget {
 }
 
 class ProfilePage extends StatelessWidget {
-  const ProfilePage({super.key});
+  final int bookCount;
+  const ProfilePage({super.key, required this.bookCount});
 
   @override
   Widget build(BuildContext context) {
@@ -686,7 +941,11 @@ class ProfilePage extends StatelessWidget {
             subtitle: Text('Tüm özellikler açık'),
           ),
           const SizedBox(height: 20),
-          const ListTile(leading: Icon(Icons.menu_book), title: Text('7 Kitap'), subtitle: Text('Kütüphanendeki kitaplar')),
+          ListTile(
+            leading: const Icon(Icons.menu_book),
+            title: Text('$bookCount Kitap'),
+            subtitle: const Text('Kütüphanendeki kitaplar'),
+          ),
           const ListTile(leading: Icon(Icons.history), title: Text('Okuma Geçmişi')),
           const ListTile(leading: Icon(Icons.favorite_border), title: Text('Favoriler')),
           const Divider(),
@@ -700,6 +959,8 @@ class ProfilePage extends StatelessWidget {
     );
   }
 }
+
+// ======================= UYGULAMA =======================
 
 void main() => runApp(const FocusReadApp());
 
@@ -731,49 +992,91 @@ class AppShell extends StatefulWidget {
 class _AppShellState extends State<AppShell> {
   int index = 0;
   bool loading = true;
-  Map<String, int> progress = {};
-
-  final books = const [
-    Book('Suç ve Ceza', 'Fyodor Dostoyevski', Icons.menu_book),
-    Book('Sapiens', 'Yuval Noah Harari', Icons.auto_stories),
-    Book('Düşün ve Zengin Ol', 'Napoleon Hill', Icons.book),
-    Book('İnsan Ne ile Yaşar', 'Lev Tolstoy', Icons.import_contacts),
-    Book('1984', 'George Orwell', Icons.library_books),
-  ];
+  List<Book> books = [];
 
   @override
   void initState() {
     super.initState();
-    _loadProgress();
+    _load();
   }
 
-  Future<void> _loadProgress() async {
-    final map = await StorageService.loadAllProgress(books.map((b) => b.title).toList());
+  Future<void> _load() async {
+    final loaded = await LibraryStore.load();
     if (!mounted) return;
     setState(() {
-      progress = map;
+      books = loaded;
       loading = false;
     });
   }
 
-  Future<void> _openBook(Book book) async {
-    final result = await Navigator.push<int>(
-      context,
-      MaterialPageRoute(builder: (_) => ReaderPage(title: book.title, bookKey: book.title)),
-    );
-    if (result != null && mounted) {
-      setState(() => progress[book.title] = result);
+  /// En son okunan kitap (hiç okunmadıysa listedeki ilk kitap).
+  Book? _continuing() {
+    Book? best;
+    for (final b in books) {
+      if (b.lastRead > 0 && (best == null || b.lastRead > best.lastRead)) {
+        best = b;
+      }
     }
+    if (best != null) return best;
+    return books.isNotEmpty ? books.first : null;
   }
 
-  Future<void> _openImported(String title, String text) async {
-    final result = await Navigator.push<int>(
+  // Not: setState burada çağrılmaz; ReaderPage dispose olurken de çağrılabilir.
+  void _onProgress(Book book, int position, int percent) {
+    book.position = position;
+    book.percent = percent;
+    book.lastRead = DateTime.now().millisecondsSinceEpoch;
+    LibraryStore.save(books);
+  }
+
+  Future<void> _openBook(Book book) async {
+    final text = await LibraryStore.readText(book.id);
+    if (!mounted) return;
+    await Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => ReaderPage(title: title, text: text, bookKey: title)),
+      MaterialPageRoute(
+        builder: (_) => ReaderPage(
+          book: book,
+          text: text,
+          onProgress: (p, pc) => _onProgress(book, p, pc),
+        ),
+      ),
     );
-    if (result != null && mounted) {
-      setState(() => progress[title] = result);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _onImported(ImportResult r) async {
+    final id = 'b_${DateTime.now().millisecondsSinceEpoch}';
+    final book = Book(
+      id: id,
+      title: r.title,
+      author: 'İçe aktarılan ${r.ext.toUpperCase()}',
+      iconIndex: 5,
+    );
+    try {
+      await LibraryStore.writeText(id, r.text);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Kitap kaydedilemedi: $e')));
+      return;
     }
+    setState(() => books.insert(0, book));
+    await LibraryStore.save(books);
+    await _openBook(book);
+  }
+
+  Future<void> _deleteBook(Book book) async {
+    await LibraryStore.deleteText(book.id);
+    setState(() => books.remove(book));
+    await LibraryStore.save(books);
+  }
+
+  Future<void> _deleteAll() async {
+    for (final b in List<Book>.from(books)) {
+      await LibraryStore.deleteText(b.id);
+    }
+    setState(() => books.clear());
+    await LibraryStore.save(books);
   }
 
   @override
@@ -782,11 +1085,29 @@ class _AppShellState extends State<AppShell> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     final pages = [
-      HomePage(books: books, progress: progress, onContinue: () => setState(() => index = 2)),
-      LibraryPage(books: books, progress: progress, onOpenBook: _openBook, onImported: _openImported),
+      HomePage(
+        books: books,
+        continuing: _continuing(),
+        onOpen: _openBook,
+        onStart: () {
+          final b = _continuing();
+          if (b != null) {
+            _openBook(b);
+          } else {
+            setState(() => index = 2);
+          }
+        },
+      ),
+      LibraryPage(
+        books: books,
+        onOpenBook: _openBook,
+        onImported: _onImported,
+        onDelete: _deleteBook,
+        onDeleteAll: _deleteAll,
+      ),
       const ReaderPage(),
       const StatsPage(),
-      const ProfilePage(),
+      ProfilePage(bookCount: books.length),
     ];
     return Scaffold(
       body: pages[index],
